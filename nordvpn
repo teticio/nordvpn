@@ -1,6 +1,15 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $0 <country> <command...>"
+  exit 2
+fi
+
+command -v jq >/dev/null || { echo "jq required"; exit 1; }
+command -v /usr/sbin/openvpn >/dev/null || { echo "openvpn required"; exit 1; }
+command -v uuidgen >/dev/null || { echo "uuid-runtime required"; exit 1; }
 
 # === Variables ===
 NS="vpnspace"
@@ -111,8 +120,8 @@ fi
 
 # === Start OpenVPN in Namespace ===
 VPN_UUID=$(uuidgen)
-VPN_PID_FILE="/tmp/openvpn-${VPN_UUID}.pid"
-VPN_LOG_FILE="/tmp/openvpn-${VPN_UUID}.log"
+VPN_PID_FILE="/run/openvpn/${VPN_UUID}.pid"
+VPN_LOG_FILE="/run/openvpn/${VPN_UUID}.log"
 sudo ip netns exec "$NS" openvpn \
     --config nordvpn.tcp.ovpn \
     --auth-user-pass nordvpn.auth \
@@ -121,14 +130,20 @@ sudo ip netns exec "$NS" openvpn \
     --writepid "$VPN_PID_FILE"
 
 if [[ ! -f "$VPN_PID_FILE" ]]; then
-    sudo cat "$VPN_LOG_FILE"  # Debugging log
+    echo "OpenVPN failed to create PID file"
+    sudo cat "$VPN_LOG_FILE" 2>/dev/null || true
     exit 1
 fi
 VPN_PID=$(cat "$VPN_PID_FILE")
 
 # Ensure cleanup on exit
 cleanup() {
-    sudo kill -9 "$VPN_PID"
+    if [[ -n "${VPN_PID:-}" ]] && ps -p "$VPN_PID" >/dev/null 2>&1; then
+        sudo kill "$VPN_PID" 2>/dev/null || true
+        sleep 1
+        sudo kill -9 "$VPN_PID" 2>/dev/null || true
+    fi
+    sudo rm -f "$VPN_PID_FILE" "$VPN_LOG_FILE"
 }
 trap cleanup EXIT SIGINT SIGTERM
 
@@ -146,4 +161,17 @@ echo -e "\033[31mIP address: $(sudo ip netns exec "$NS" curl -s https://ipinfo.i
 
 # Shift and execute the command passed to the script
 shift
-sudo ip netns exec "$NS" sudo -u $USER -- "$@"
+
+TARGET_USER=${SUDO_USER:-$(id -un)}
+TARGET_UID=$(id -u "$TARGET_USER")
+
+sudo ip netns exec "$NS" \
+  sudo -u "$TARGET_USER" \
+  env \
+    XDG_RUNTIME_DIR="/run/user/$TARGET_UID" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$TARGET_UID/bus" \
+    WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+    DISPLAY="${DISPLAY:-}" \
+    XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+    QT_QPA_PLATFORM=wayland \
+  bash -c 'exec "$@"' bash "$@"
