@@ -10,7 +10,7 @@ You will need to have installed `openvpn`, `jq` and `uuid-runtime`. Depending on
 
 ## Usage
 
-Create a file `nordvpn.auth` with your NordVPN username and password obtained from https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/service-credentials/:
+Create a file `.nordvpn.auth` in your home directory with your NordVPN username and password obtained from https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/service-credentials/:
 
 ```bash
 <username>

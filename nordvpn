@@ -110,7 +110,7 @@ echo "Load: $server_load%"
 echo "Hostname: $server_hostname"
 
 # === Download OpenVPN Configuration File ===
-ovpn_file="nordvpn.tcp.ovpn"
+ovpn_file="$HOME/.nordvpn.tcp.ovpn"
 ovpn_url="https://downloads.nordcdn.com/configs/files/ovpn_tcp/servers/${server_hostname}.tcp.ovpn"
 curl -s -o "$ovpn_file" "$ovpn_url"
 if [[ ! -s "$ovpn_file" ]]; then
@@ -123,8 +123,8 @@ VPN_UUID=$(uuidgen)
 VPN_PID_FILE="/run/openvpn/${VPN_UUID}.pid"
 VPN_LOG_FILE="/run/openvpn/${VPN_UUID}.log"
 sudo ip netns exec "$NS" openvpn \
-    --config nordvpn.tcp.ovpn \
-    --auth-user-pass nordvpn.auth \
+    --config "$ovpn_file" \
+    --auth-user-pass "$HOME/.nordvpn.auth" \
     --daemon \
     --log "$VPN_LOG_FILE" \
     --writepid "$VPN_PID_FILE"
