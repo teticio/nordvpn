@@ -10,14 +10,31 @@ fi
 command -v jq >/dev/null || { echo "jq required"; exit 1; }
 command -v /usr/sbin/openvpn >/dev/null || { echo "openvpn required"; exit 1; }
 command -v uuidgen >/dev/null || { echo "uuid-runtime required"; exit 1; }
+command -v flock >/dev/null || { echo "flock (util-linux) required"; exit 1; }
 
-# === Variables ===
-NS="vpnspace"
-HOST_IF="host-veth"
-NS_IF="ns-veth"
-SUBNET="10.200.1.0/24"
-HOST_IP="10.200.1.1"
-NS_IP="10.200.1.2"
+# === State Directory ===
+STATE_DIR="/run/nordvpn"
+sudo install -d -m 0755 "$STATE_DIR" "$STATE_DIR/countries"
+
+GLOBAL_LOCK="$STATE_DIR/global.lock"
+[[ -e "$GLOBAL_LOCK" ]] || sudo install -m 0666 /dev/null "$GLOBAL_LOCK"
+
+# === Country Key ===
+COUNTRY_RAW="$1"
+shift
+COUNTRY_KEY=$(printf %s "$COUNTRY_RAW" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_')
+[[ -z "$COUNTRY_KEY" ]] && COUNTRY_KEY="any"
+
+COUNTRY_DIR="$STATE_DIR/countries/$COUNTRY_KEY"
+COUNTRY_LOCK="$STATE_DIR/${COUNTRY_KEY}.lock"
+[[ -e "$COUNTRY_LOCK" ]] || sudo install -m 0666 /dev/null "$COUNTRY_LOCK"
+
+# OpenVPN's AppArmor profile only allows reads/writes under @{HOME} (plus
+# /run/openvpn/*.pid). /run/nordvpn/ is for script state only.
+OVPN_DIR="$HOME/.nordvpn-cache/$COUNTRY_KEY"
+mkdir -p "$OVPN_DIR"
+
+SESSION_ID="$$-$(uuidgen)"
 
 # === Determine External Interface ===
 EXT_IF=$(ip route show default | awk '/default/ {print $5; exit}')
@@ -26,142 +43,233 @@ if [ -z "$EXT_IF" ]; then
   exit 1
 fi
 
-# === Create Network Namespace ===
-if ! sudo ip netns list | grep -q "$NS"; then
-  sudo ip netns add "$NS"
+# === Lock fds ===
+exec 9>"$GLOBAL_LOCK"
+exec 8>"$COUNTRY_LOCK"
+
+# === Phase 1: Allocate/lookup subnet and register session (under global lock) ===
+flock 9
+
+if [[ -f "$COUNTRY_DIR/subnet_idx" ]]; then
+    SUBNET_IDX=$(sudo cat "$COUNTRY_DIR/subnet_idx")
+else
+    SUBNET_IDX=1
+    used_idxs=$(for d in "$STATE_DIR/countries"/*/; do
+        if [[ -f "$d/subnet_idx" ]]; then
+            sudo cat "$d/subnet_idx"
+        fi
+    done 2>/dev/null)
+    while printf '%s\n' "$used_idxs" | grep -qx "$SUBNET_IDX"; do
+        SUBNET_IDX=$((SUBNET_IDX + 1))
+        if [[ $SUBNET_IDX -gt 254 ]]; then
+            echo "No available subnets"
+            flock -u 9
+            exit 1
+        fi
+    done
+    sudo install -d -m 0755 "$COUNTRY_DIR"
+    echo "$SUBNET_IDX" | sudo tee "$COUNTRY_DIR/subnet_idx" >/dev/null
 fi
 
-# === Create and Configure veth Pair ===
-if ! sudo ip link show "$HOST_IF" &>/dev/null; then
-  sudo ip link add "$HOST_IF" type veth peer name "$NS_IF"
+sudo install -d -m 0755 "$COUNTRY_DIR/sessions"
+
+# Garbage-collect sessions whose owner process is gone (e.g. SIGKILLed)
+for s in "$COUNTRY_DIR/sessions"/*; do
+    [[ -f "$s" ]] || continue
+    pid=$(sudo cat "$s" 2>/dev/null || true)
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        sudo rm -f "$s"
+    fi
+done
+
+# Register this session
+echo "$$" | sudo tee "$COUNTRY_DIR/sessions/$SESSION_ID" >/dev/null
+
+flock -u 9
+
+# === Network Variables ===
+NS="vpnns${SUBNET_IDX}"
+HOST_IF="vpn${SUBNET_IDX}h"
+NS_IF="vpn${SUBNET_IDX}n"
+SUBNET="10.200.${SUBNET_IDX}.0/24"
+HOST_IP="10.200.${SUBNET_IDX}.1"
+NS_IP="10.200.${SUBNET_IDX}.2"
+
+# === Cleanup ===
+cleanup() {
+    set +e
+    flock 9
+    sudo rm -f "$COUNTRY_DIR/sessions/$SESSION_ID"
+    local remaining=0
+    if [[ -d "$COUNTRY_DIR/sessions" ]]; then
+        for s in "$COUNTRY_DIR/sessions"/*; do
+            [[ -f "$s" ]] || continue
+            remaining=$((remaining + 1))
+        done
+    fi
+    if [[ $remaining -eq 0 ]]; then
+        flock 8
+        if [[ -f "$OVPN_DIR/openvpn.pid" ]]; then
+            local vpn_pid
+            vpn_pid=$(sudo cat "$OVPN_DIR/openvpn.pid" 2>/dev/null)
+            if [[ -n "$vpn_pid" ]] && sudo kill -0 "$vpn_pid" 2>/dev/null; then
+                sudo kill "$vpn_pid" 2>/dev/null
+                sleep 1
+                sudo kill -9 "$vpn_pid" 2>/dev/null || true
+            fi
+        fi
+        sudo iptables -t nat -D POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE 2>/dev/null
+        sudo iptables -D FORWARD -i "$EXT_IF" -o "$HOST_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+        sudo iptables -D FORWARD -i "$HOST_IF" -o "$EXT_IF" -j ACCEPT 2>/dev/null
+        sudo ip link del "$HOST_IF" 2>/dev/null
+        sudo ip netns del "$NS" 2>/dev/null
+        sudo rm -rf "/etc/netns/$NS"
+        sudo rm -rf "$COUNTRY_DIR"
+        sudo rm -rf "$OVPN_DIR"
+        flock -u 8
+    fi
+    flock -u 9
+}
+trap cleanup EXIT SIGINT SIGTERM
+
+# === Phase 2: Setup namespace + tunnel (under country lock) ===
+flock 8
+
+NEED_SETUP=0
+VPN_PID=""
+if [[ -f "$OVPN_DIR/openvpn.pid" ]]; then
+    VPN_PID=$(sudo cat "$OVPN_DIR/openvpn.pid" 2>/dev/null || true)
+fi
+if [[ -z "$VPN_PID" ]] || ! sudo kill -0 "$VPN_PID" 2>/dev/null; then
+    NEED_SETUP=1
 fi
 
-if ! sudo ip netns exec "$NS" ip link show "$NS_IF" &>/dev/null; then
-  sudo ip link set "$NS_IF" netns "$NS"
-fi
+if [[ $NEED_SETUP -eq 1 ]]; then
+    # === Create Network Namespace ===
+    if ! sudo ip netns list | awk '{print $1}' | grep -qx "$NS"; then
+        sudo ip netns add "$NS"
+    fi
 
-# === Configure IP Addresses ===
-# Host side configuration
-sudo ip addr add "$HOST_IP/24" dev "$HOST_IF" 2>/dev/null || true
-sudo ip link set "$HOST_IF" up
+    # === Create and Configure veth Pair ===
+    if ! sudo ip link show "$HOST_IF" &>/dev/null; then
+        sudo ip link add "$HOST_IF" type veth peer name "$NS_IF"
+    fi
 
-# Namespace side configuration
-sudo ip netns exec "$NS" ip addr add "$NS_IP/24" dev "$NS_IF" 2>/dev/null || true
-sudo ip netns exec "$NS" ip link set "$NS_IF" up
-sudo ip netns exec "$NS" ip link set lo up
+    if ! sudo ip netns exec "$NS" ip link show "$NS_IF" &>/dev/null; then
+        sudo ip link set "$NS_IF" netns "$NS"
+    fi
 
-# === Add Routes in Namespace ===
-sudo ip netns exec "$NS" ip route add "$SUBNET" dev "$NS_IF" 2>/dev/null || true
-sudo ip netns exec "$NS" ip route add default via "$HOST_IP" dev "$NS_IF" 2>/dev/null || true
+    # === Configure IP Addresses ===
+    sudo ip addr add "$HOST_IP/24" dev "$HOST_IF" 2>/dev/null || true
+    sudo ip link set "$HOST_IF" up
 
-# === Enable IP Forwarding ===
-sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sudo ip netns exec "$NS" ip addr add "$NS_IP/24" dev "$NS_IF" 2>/dev/null || true
+    sudo ip netns exec "$NS" ip link set "$NS_IF" up
+    sudo ip netns exec "$NS" ip link set lo up
 
-# === Set Up NAT with iptables ===
-sudo iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE 2>/dev/null || \
-sudo iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE
+    # === Routes in Namespace ===
+    sudo ip netns exec "$NS" ip route add "$SUBNET" dev "$NS_IF" 2>/dev/null || true
+    sudo ip netns exec "$NS" ip route add default via "$HOST_IP" dev "$NS_IF" 2>/dev/null || true
 
-# === Configure FORWARD Rules ===
-sudo iptables -C FORWARD -i "$EXT_IF" -o "$HOST_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-sudo iptables -A FORWARD -i "$EXT_IF" -o "$HOST_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -C FORWARD -i "$HOST_IF" -o "$EXT_IF" -j ACCEPT 2>/dev/null || \
-sudo iptables -A FORWARD -i "$HOST_IF" -o "$EXT_IF" -j ACCEPT
+    # === IP Forwarding ===
+    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-# === Configure DNS for Namespace ===
-sudo mkdir -p /etc/netns/"$NS"
-cat <<EOF | sudo tee /etc/netns/"$NS"/resolv.conf >/dev/null
+    # === NAT and FORWARD rules (per-subnet, so they don't collide between countries) ===
+    sudo iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE 2>/dev/null || \
+        sudo iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE
+    sudo iptables -C FORWARD -i "$EXT_IF" -o "$HOST_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        sudo iptables -A FORWARD -i "$EXT_IF" -o "$HOST_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    sudo iptables -C FORWARD -i "$HOST_IF" -o "$EXT_IF" -j ACCEPT 2>/dev/null || \
+        sudo iptables -A FORWARD -i "$HOST_IF" -o "$EXT_IF" -j ACCEPT
+
+    # === DNS for Namespace ===
+    sudo mkdir -p "/etc/netns/$NS"
+    cat <<EOF | sudo tee "/etc/netns/$NS/resolv.conf" >/dev/null
 nameserver 8.8.8.8
 nameserver 8.8.4.4
 EOF
 
-# === Fetch NordVPN Server List ===
-response=$(curl -s "https://api.nordvpn.com/v1/servers?limit=0")
-if [[ -z "$response" ]]; then
-    echo "Failed to fetch NordVPN server data."
-    exit 1
-fi
-
-# === Find the Best OpenVPN TCP Server ===
-search_country="$1"
-best_server=$(echo "$response" | jq -r --arg country "$search_country" '
-    .[] | 
-    select(.technologies[]?.pivot.technology_id == 3 and .status == "online") | 
-    {name: .name, hostname: .hostname, load: .load, country: .locations[0].country.name} |
-    select((.country | test($country; "i")) or ($country == "")) |
-    @base64' | sort -t "|" -k3,3n | head -n1)
-
-if [[ -z "$best_server" ]]; then
-    echo "No OpenVPN TCP servers found."
-    exit 1
-fi
-
-# === Extract Best Server Details ===
-best_server_json=$(echo "$best_server" | base64 --decode | jq -r '.')
-server_name=$(echo "$best_server_json" | jq -r '.name')
-server_country=$(echo "$best_server_json" | jq -r '.country')
-server_load=$(echo "$best_server_json" | jq -r '.load')
-server_hostname=$(echo "$best_server_json" | jq -r '.hostname')
-
-# Print best server details
-echo "Best OpenVPN TCP Server:"
-echo "Name: $server_name"
-echo "Country: $server_country"
-echo "Load: $server_load%"
-echo "Hostname: $server_hostname"
-
-# === Download OpenVPN Configuration File ===
-ovpn_file="$HOME/.nordvpn.tcp.ovpn"
-ovpn_url="https://downloads.nordcdn.com/configs/files/ovpn_tcp/servers/${server_hostname}.tcp.ovpn"
-curl -s -o "$ovpn_file" "$ovpn_url"
-if [[ ! -s "$ovpn_file" ]]; then
-    echo "Failed to download .ovpn file."
-    exit 1
-fi
-
-# === Start OpenVPN in Namespace ===
-VPN_UUID=$(uuidgen)
-VPN_PID_FILE="/run/openvpn/${VPN_UUID}.pid"
-VPN_LOG_FILE="/run/openvpn/${VPN_UUID}.log"
-sudo ip netns exec "$NS" openvpn \
-    --config "$ovpn_file" \
-    --auth-user-pass "$HOME/.nordvpn.auth" \
-    --daemon \
-    --log "$VPN_LOG_FILE" \
-    --writepid "$VPN_PID_FILE"
-
-if [[ ! -f "$VPN_PID_FILE" ]]; then
-    echo "OpenVPN failed to create PID file"
-    sudo cat "$VPN_LOG_FILE" 2>/dev/null || true
-    exit 1
-fi
-VPN_PID=$(cat "$VPN_PID_FILE")
-
-# Ensure cleanup on exit
-cleanup() {
-    if [[ -n "${VPN_PID:-}" ]] && ps -p "$VPN_PID" >/dev/null 2>&1; then
-        sudo kill "$VPN_PID" 2>/dev/null || true
-        sleep 1
-        sudo kill -9 "$VPN_PID" 2>/dev/null || true
+    # === Fetch NordVPN Server List ===
+    response=$(curl -s "https://api.nordvpn.com/v1/servers?limit=0")
+    if [[ -z "$response" ]]; then
+        echo "Failed to fetch NordVPN server data."
+        exit 1
     fi
-    sudo rm -f "$VPN_PID_FILE" "$VPN_LOG_FILE"
-}
-trap cleanup EXIT SIGINT SIGTERM
 
-# Wait and verify VPN connection
-sleep 5
-if ! ps -p $VPN_PID > /dev/null; then
-    echo -e "\033[31mVPN failed to start\033[0m"
-    echo -e "\033[33mOpenVPN log output:\033[0m"
-    cat "$VPN_LOG_FILE"  # Debugging log
-    exit 1
+    # === Find the Best OpenVPN TCP Server ===
+    best_server=$(echo "$response" | jq -r --arg country "$COUNTRY_RAW" '
+        .[] |
+        select(.technologies[]?.pivot.technology_id == 3 and .status == "online") |
+        {name: .name, hostname: .hostname, load: .load, country: .locations[0].country.name} |
+        select((.country | test($country; "i")) or ($country == "")) |
+        @base64' | sort -t "|" -k3,3n | head -n1)
+
+    if [[ -z "$best_server" ]]; then
+        echo "No OpenVPN TCP servers found."
+        exit 1
+    fi
+
+    best_server_json=$(echo "$best_server" | base64 --decode | jq -r '.')
+    server_name=$(echo "$best_server_json" | jq -r '.name')
+    server_country=$(echo "$best_server_json" | jq -r '.country')
+    server_load=$(echo "$best_server_json" | jq -r '.load')
+    server_hostname=$(echo "$best_server_json" | jq -r '.hostname')
+
+    echo "Best OpenVPN TCP Server:"
+    echo "Name: $server_name"
+    echo "Country: $server_country"
+    echo "Load: $server_load%"
+    echo "Hostname: $server_hostname"
+
+    # === Download OpenVPN Configuration File (under $HOME so AppArmor allows it) ===
+    ovpn_file="$OVPN_DIR/server.ovpn"
+    ovpn_url="https://downloads.nordcdn.com/configs/files/ovpn_tcp/servers/${server_hostname}.tcp.ovpn"
+    curl -s -o "$ovpn_file" "$ovpn_url"
+    if [[ ! -s "$ovpn_file" ]]; then
+        echo "Failed to download .ovpn file."
+        exit 1
+    fi
+
+    # === Start OpenVPN in Namespace ===
+    sudo ip netns exec "$NS" openvpn \
+        --config "$ovpn_file" \
+        --auth-user-pass "$HOME/.nordvpn.auth" \
+        --daemon \
+        --log "$OVPN_DIR/openvpn.log" \
+        --writepid "$OVPN_DIR/openvpn.pid"
+
+    # Wait for the tunnel to come up (or for openvpn to die)
+    elapsed=0
+    timeout=30
+    while :; do
+        if sudo grep -q "Initialization Sequence Completed" "$OVPN_DIR/openvpn.log" 2>/dev/null; then
+            break
+        fi
+        if [[ ! -f "$OVPN_DIR/openvpn.pid" ]] || \
+           ! sudo kill -0 "$(sudo cat "$OVPN_DIR/openvpn.pid" 2>/dev/null)" 2>/dev/null; then
+            echo -e "\033[31mVPN failed to start\033[0m"
+            echo -e "\033[33mOpenVPN log output:\033[0m"
+            sudo cat "$OVPN_DIR/openvpn.log" 2>/dev/null || true
+            exit 1
+        fi
+        if [[ $elapsed -ge $timeout ]]; then
+            echo -e "\033[31mVPN handshake timed out after ${timeout}s\033[0m"
+            sudo cat "$OVPN_DIR/openvpn.log" 2>/dev/null || true
+            exit 1
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    echo -e "\033[31mIP address: $(sudo ip netns exec "$NS" curl -s https://ipinfo.io/ip)\033[0m"
+else
+    echo -e "\033[32mReusing existing VPN connection for '$COUNTRY_RAW' (subnet idx $SUBNET_IDX)\033[0m"
+    echo -e "\033[31mIP address: $(sudo ip netns exec "$NS" curl -s https://ipinfo.io/ip)\033[0m"
 fi
 
-# Print VPN IP
-echo -e "\033[31mIP address: $(sudo ip netns exec "$NS" curl -s https://ipinfo.io/ip)\033[0m"
+flock -u 8
 
-# Shift and execute the command passed to the script
-shift
-
+# === Run command in namespace ===
 TARGET_USER=${SUDO_USER:-$(id -un)}
 TARGET_UID=$(id -u "$TARGET_USER")
 
