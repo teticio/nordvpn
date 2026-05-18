@@ -29,11 +29,12 @@ For example:
 ./nordvpn Spain curl -s https://ipinfo.io/ip
 ```
 
+Multiple invocations can run in parallel: sessions for the same country share one tunnel; different countries each get their own namespace and connection.
+
 ## How it works
 
-The script creates a network namespace called `vpnspace` to run both `OpenVPN` and your command. It queries a NordVPN endpoint to retrieve available servers and selects the best one in the chosen country (i.e., with the lowest load). It then downloads the corresponding `ovpn` configuration and connects using your credentials.
+For each country, the script creates a dedicated network namespace (`vpnns<N>`) connected to the host via a veth pair, brings up `OpenVPN` inside it, and runs your command in that namespace. It queries a NordVPN endpoint to pick the lowest-load server in the chosen country and downloads its `.ovpn` config.
 
-The network namespace will persist until the next reboot. After a reboot, the following configurations will remain:
+Parallel invocations are coordinated through a session ref-count under `/run/nordvpn/countries/<country>/sessions/`: the first call sets the tunnel up, subsequent calls for the same country reuse it, and the last call to exit tears everything down (openvpn process, iptables rules, veth, namespace, DNS overlay, state dir, and `~/.nordvpn-cache/<country>/`). Sessions whose owner process is gone (e.g. `kill -9`) are garbage-collected on the next run.
 
-- IP forwarding will be enabled; you can disable it by running `sudo sysctl net.ipv4.ip_forward=0`.
-- A directory `/etc/netns/vpnspace` will exist and contain the DNS configuration. This directory can be safely deleted if needed.
+State lives in `/run/nordvpn/` (cleared on reboot) and `~/.nordvpn-cache/` (openvpn config/log/pid — kept under `$HOME` because openvpn's AppArmor profile only allows reads/writes there).
