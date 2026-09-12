@@ -96,6 +96,60 @@ HOST_IP="10.200.${SUBNET_IDX}.1"
 NS_IP="10.200.${SUBNET_IDX}.2"
 
 # === Cleanup ===
+# === Ensure NAT / FORWARD rules match the CURRENT external interface ===
+# The default route can change between runs (e.g. Wi-Fi switched off, Ethernet
+# takes over). Rules created by an earlier run still name the old interface, so
+# the namespace gets no NAT and OpenVPN inside it cannot reach the server --
+# with no error, just an empty "IP address:". Revalidate on every run.
+ensure_nat_rules() {
+    local current
+    current=$(ip route show default | awk '/default/ {print $5; exit}')
+    [[ -n "$current" ]] && EXT_IF="$current"
+
+    local iface
+    while read -r iface; do
+        [[ -n "$iface" && "$iface" != "$EXT_IF" ]] || continue
+        sudo iptables -t nat -D POSTROUTING -s "$SUBNET" -o "$iface" -j MASQUERADE 2>/dev/null || true
+    done < <(sudo iptables -t nat -S POSTROUTING 2>/dev/null | awk -v s="$SUBNET" '$0 ~ ("-s " s) && /MASQUERADE/ {for (i=1; i<NF; i++) if ($i == "-o") print $(i+1)}')
+
+    while read -r iface; do
+        [[ -n "$iface" && "$iface" != "$EXT_IF" ]] || continue
+        sudo iptables -D FORWARD -i "$iface" -o "$HOST_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        sudo iptables -D FORWARD -i "$HOST_IF" -o "$iface" -j ACCEPT 2>/dev/null || true
+    done < <(sudo iptables -S FORWARD 2>/dev/null | awk -v h="$HOST_IF" '$0 ~ ("-o " h) {for (i=1; i<NF; i++) if ($i == "-i") print $(i+1)}')
+
+    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    sudo iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE 2>/dev/null || \
+        sudo iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE
+    sudo iptables -C FORWARD -i "$EXT_IF" -o "$HOST_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        sudo iptables -A FORWARD -i "$EXT_IF" -o "$HOST_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    sudo iptables -C FORWARD -i "$HOST_IF" -o "$EXT_IF" -j ACCEPT 2>/dev/null || \
+        sudo iptables -A FORWARD -i "$HOST_IF" -o "$EXT_IF" -j ACCEPT
+}
+
+# === Restore Host DNS ===
+# A VPN client (NetworkManager or nordvpnd) can reconfigure systemd-resolved
+# over D-Bus and leave the host link with no DNS servers and/or
+# "default route: no". Every host process then fails to resolve names, with
+# resolved reporting "No appropriate name servers or networks for name found".
+# Teardown restores the link so the host is never left without DNS.
+restore_host_dns() {
+    local ext="${EXT_IF:-}"
+    [[ -n "$ext" ]] || return 0
+    command -v resolvectl >/dev/null || return 0
+    sudo resolvectl default-route "$ext" yes >/dev/null 2>&1 || true
+    if ! resolvectl dns "$ext" 2>/dev/null | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:[0-9a-fA-F]*:'; then
+        local dhcp_dns
+        dhcp_dns=$(nmcli -g IP4.DNS device show "$ext" 2>/dev/null | tr '\n' ' ')
+        if [[ -n "${dhcp_dns// /}" ]]; then
+            sudo resolvectl dns "$ext" $dhcp_dns >/dev/null 2>&1 || true
+        else
+            sudo nmcli device reapply "$ext" >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
 cleanup() {
     set +e
     flock 9
@@ -126,6 +180,7 @@ cleanup() {
         sudo rm -rf "/etc/netns/$NS"
         sudo rm -rf "$COUNTRY_DIR"
         sudo rm -rf "$OVPN_DIR"
+        restore_host_dns
         flock -u 8
     fi
     flock -u 9
@@ -264,6 +319,7 @@ EOF
     echo -e "\033[31mIP address: $(sudo ip netns exec "$NS" curl -s https://ipinfo.io/ip)\033[0m"
 else
     echo -e "\033[32mReusing existing VPN connection for '$COUNTRY_RAW' (subnet idx $SUBNET_IDX)\033[0m"
+    ensure_nat_rules
     echo -e "\033[31mIP address: $(sudo ip netns exec "$NS" curl -s https://ipinfo.io/ip)\033[0m"
 fi
 
