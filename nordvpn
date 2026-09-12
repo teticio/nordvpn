@@ -286,7 +286,14 @@ EOF
     fi
 
     # === Start OpenVPN in Namespace ===
+    # --dns-updown disable: OpenVPN 2.6+ runs /usr/libexec/openvpn/dns-updown when
+    # the server pushes DNS. A netns does NOT isolate D-Bus, so that handler's
+    # "resolvectl dns tun0 ..." resolves tun0 to ifindex 2 *inside* this namespace
+    # and then calls the HOST's systemd-resolved, which applies it to host link 2
+    # (enp4s0) -- hijacking host DNS on connect and wiping it on disconnect.
+    # The namespace has its own /etc/netns/$NS/resolv.conf, so we never want this.
     sudo ip netns exec "$NS" openvpn \
+        --dns-updown disable \
         --config "$ovpn_file" \
         --auth-user-pass "$HOME/.nordvpn.auth" \
         --daemon \
