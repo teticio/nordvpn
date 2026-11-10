@@ -244,22 +244,25 @@ nameserver 8.8.8.8
 nameserver 8.8.4.4
 EOF
 
-    # === Fetch NordVPN Server List ===
-    response=$(curl -s "https://api.nordvpn.com/v1/servers?limit=0")
-    if [[ -z "$response" ]]; then
-        echo "Failed to fetch NordVPN server data."
-        exit 1
-    fi
-
     # === Find the Best OpenVPN TCP Server ===
-    # Lowest load picked inside jq: `| sort | head -n1` dies of SIGPIPE under pipefail
-    # once there are more servers than a pipe buffer holds (the US has thousands).
-    best_server=$(echo "$response" | jq -r --arg country "$COUNTRY_RAW" '
-        [.[] |
-        select(any(.technologies[]?; .pivot.technology_id == 3) and .status == "online") |
+    # NordVPN's own recommendation (what the website offers): only servers that accept logins.
+    # Picking from the full list by lowest load lands on servers being retired, which report
+    # 0% load and answer every login with AUTH_FAILED.
+    country_id=""
+    if [[ -n "$COUNTRY_RAW" ]]; then
+        country_id=$(curl -s "https://api.nordvpn.com/v1/servers/countries" | jq -r --arg country "$COUNTRY_RAW" '
+            [.[] | select(.name | test($country; "i"))][0].id // empty')
+        if [[ -z "$country_id" ]]; then
+            echo "No NordVPN country matches '$COUNTRY_RAW'."
+            exit 1
+        fi
+    fi
+    url="https://api.nordvpn.com/v1/servers/recommendations?filters\[servers_technologies\]\[identifier\]=openvpn_tcp&limit=1"
+    [[ -n "$country_id" ]] && url+="&filters\[country_id\]=$country_id"
+    best_server=$(curl -s "$url" | jq -r '
+        .[0] // empty |
         {name: .name, hostname: .hostname, load: .load, country: .locations[0].country.name} |
-        select((.country | test($country; "i")) or ($country == ""))] |
-        sort_by(.load) | .[0] // empty | @base64')
+        @base64')
 
     if [[ -z "$best_server" ]]; then
         echo "No OpenVPN TCP servers found."
