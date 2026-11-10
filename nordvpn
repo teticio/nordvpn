@@ -252,12 +252,14 @@ EOF
     fi
 
     # === Find the Best OpenVPN TCP Server ===
+    # Lowest load picked inside jq: `| sort | head -n1` dies of SIGPIPE under pipefail
+    # once there are more servers than a pipe buffer holds (the US has thousands).
     best_server=$(echo "$response" | jq -r --arg country "$COUNTRY_RAW" '
-        .[] |
-        select(.technologies[]?.pivot.technology_id == 3 and .status == "online") |
+        [.[] |
+        select(any(.technologies[]?; .pivot.technology_id == 3) and .status == "online") |
         {name: .name, hostname: .hostname, load: .load, country: .locations[0].country.name} |
-        select((.country | test($country; "i")) or ($country == "")) |
-        @base64' | sort -t "|" -k3,3n | head -n1)
+        select((.country | test($country; "i")) or ($country == ""))] |
+        sort_by(.load) | .[0] // empty | @base64')
 
     if [[ -z "$best_server" ]]; then
         echo "No OpenVPN TCP servers found."
